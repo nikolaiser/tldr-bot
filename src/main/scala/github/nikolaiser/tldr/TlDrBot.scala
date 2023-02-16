@@ -10,11 +10,17 @@ import zio.interop.catz.*
 import zio.interop.*
 import java.time.Instant
 
+import scala.annotation.tailrec
+
 object TlDrBot:
   private val ttlSeconds = 60 * 60 * 24
 
   private case class Key(chatId: Long, messageId: Int)
-  private case class Data(timestamp: Instant, repliesCount: Int)
+  private sealed trait Data:
+    def timestamp: Instant
+  private object Data:
+    case class Root(timestamp: Instant, repliesCount: Int) extends Data
+    case class Reply(timestamp: Instant, replyTo: Option[Int]) extends Data
 
   private case class TlDrBotLive(
       cache: ConcurrentMap[Key, Data],
@@ -24,8 +30,9 @@ object TlDrBot:
     given Api[Task] = api
 
     override def onMessage(msg: Message): Task[Unit] =
+      ZIO.attempt(println(msg.chat.id)) *> (
       if msg.text.exists(_.startsWith("/tldr")) then
-        getTop
+        getTop(msg.chat.id)
           .map(toResultMessage(_, msg))
           .flatMap(text =>
             Methods
@@ -33,21 +40,48 @@ object TlDrBot:
               .exec
               .unit
           )
-      else saveMessage(msg).unit
+      else saveMessage(msg).unit)
 
-    private def getTop: Task[List[Int]] = cache.toList.map(_.sortWith {
-      case (e1, e2) => e1._2.repliesCount > e2._2.repliesCount
-    }.take(limit).map(_._1.messageId))
+    private def getTop(chatId: Long): Task[List[Int]] = cache.toList.map(
+      _.filter(_._1.chatId == chatId)
+        .collect[(Key, Data.Root)] { case (key, x: Data.Root) =>
+          (key, x)
+        }
+        .sortWith { case (e1, e2) =>
+          e1._2.repliesCount > e2._2.repliesCount
+        }
+        .take(limit)
+        .map(_._1.messageId)
+    )
+
+    private def findRoot(chatId: Long, messageId: Int): UIO[Option[Int]] =
+      cache.get(Key(chatId, messageId)).flatMap {
+        case None                               => ZIO.none
+        case Some(Data.Root(_, _))              => ZIO.some(messageId)
+        case Some(Data.Reply(_, None))          => ZIO.none
+        case Some(Data.Reply(_, Some(replyTo))) => findRoot(chatId, replyTo)
+      }
 
     private def saveMessage(msg: Message) =
       for {
         now <- ZIO.clockWith(_.instant)
         _ <- msg.replyToMessage.fold(
-          cache.put(Key(msg.chat.id, msg.messageId), Data(now, 0))
+          cache.put(Key(msg.chat.id, msg.messageId), Data.Root(now, 0))
         )(initial =>
-          cache.compute(
-            Key(initial.chat.id, initial.messageId),
-            (_, oldValue) => oldValue.map { case Data(i, c) => Data(i, c + 1) }
+          cache.put(
+            Key(msg.chat.id, msg.messageId),
+            Data.Reply(now, Some(initial.messageId))
+          ) *> findRoot(initial.chat.id, msg.messageId).flatMap(
+            _.fold(ZIO.unit)(root =>
+              cache.compute(
+                Key(initial.chat.id, root),
+                (_, oldValue) =>
+                  oldValue.map {
+                    case Data.Root(i, c) => Data.Root(i, c + 1)
+                    case x               => x
+                  }
+              )
+            )
           )
         )
       } yield ()
@@ -55,7 +89,7 @@ object TlDrBot:
     private def toResultMessage(messages: List[Int], root: Message): String =
       messages.zipWithIndex
         .map { (id, index) =>
-          s"${index + 1}. https://t.me/c/${root.chat.id.abs.toString.drop(3)}/$id"
+          s"${index + 1}. https://t.me/c/${root.chat.id.abs.toString.takeRight(10)}/$id"
         }
         .mkString("\n")
 
