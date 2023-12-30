@@ -1,10 +1,10 @@
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
-ThisBuild / scalaVersion := "3.2.2"
+ThisBuild / scalaVersion := "3.3.1"
 
 val zioVersion = "2.0.9"
 val zioInteropCatsVersion = "23.0.0.1"
-val telegramiumVersion = "7.65.0"
+val telegramiumVersion = "8.69.0"
 
 lazy val root = (project in file("."))
   .settings(
